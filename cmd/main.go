@@ -17,21 +17,26 @@ import (
 	"ssh-roundrobin/internal/sshroundrobin"
 )
 
-func tunnelBidirectional(left net.Conn, right net.Conn) {
+func tunnelBidirectional(left net.Conn, right net.Conn) (int64, int64) {
 	var wg sync.WaitGroup
+	var rightToLeft int64
+	var leftToRight int64
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(left, right)
+		n, _ := io.Copy(left, right)
+		rightToLeft = n
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(right, left)
+		n, _ := io.Copy(right, left)
+		leftToRight = n
 	}()
 
 	wg.Wait()
+	return rightToLeft, leftToRight
 }
 
 const (
@@ -46,28 +51,28 @@ const (
 	socksReplyAddrUnsup = 0x08
 )
 
-func handleConnection(conn net.Conn, rr *sshroundrobin.RoundRobin, targetHost string, targetPort int) {
+func handleConnection(conn net.Conn, rr *sshroundrobin.RoundRobin, targetHost string, targetPort int, retryUpstreams int, failThreshold int, failTTL time.Duration) {
 	defer conn.Close()
 
-	client, err := rr.Get()
-	if err != nil {
-		log.Printf("Failed to get server: %v", err)
-		return
-	}
-	log.Printf("Upstream selected %s (mode=%s hits=%d)", client.ServerAddr(), client.ServerMode(), client.SelectionCount())
-
-	sshConn := client.Client()
-
 	targetAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
-	targetConn, err := sshConn.Dial("tcp", targetAddr)
+	targetConn, client, err := dialTargetWithRetries(rr, targetAddr, retryUpstreams, failThreshold, failTTL)
 	if err != nil {
-		log.Printf("Failed to connect to target %s: %v", targetAddr, err)
+		log.Printf("Failed to connect to target %s after retries: %v", targetAddr, err)
 		return
 	}
 	defer targetConn.Close()
 
 	log.Printf("Forwarding connection to %s", targetAddr)
-	tunnelBidirectional(conn, targetConn)
+	start := time.Now()
+	rightToLeft, leftToRight := tunnelBidirectional(conn, targetConn)
+
+	if isLikelyTargetBlocked(start, rightToLeft, leftToRight) {
+		err = fmt.Errorf("tunnel ended too quickly without upstream response")
+		rr.ReportTargetFailure(client, targetAddr, failThreshold, failTTL, err)
+		log.Printf("Marked upstream-target as failed after short tunnel: upstream=%s target=%s c2u=%d u2c=%d elapsed=%s", client.ServerAddr(), targetAddr, leftToRight, rightToLeft, time.Since(start).Round(time.Millisecond))
+	} else {
+		rr.ReportTargetSuccess(client, targetAddr)
+	}
 }
 
 func writeSocks5Reply(conn net.Conn, reply byte) {
@@ -127,17 +132,8 @@ func readSocks5Target(conn net.Conn) (string, error) {
 	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
-func handleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin) {
+func handleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin, retryUpstreams int, failThreshold int, failTTL time.Duration) {
 	defer conn.Close()
-
-	client, err := rr.Get()
-	if err != nil {
-		log.Printf("Failed to get server: %v", err)
-		return
-	}
-	log.Printf("Upstream selected %s (mode=%s hits=%d)", client.ServerAddr(), client.ServerMode(), client.SelectionCount())
-
-	sshConn := client.Client()
 
 	hello := make([]byte, 2)
 	if _, err := io.ReadFull(conn, hello); err != nil {
@@ -176,17 +172,75 @@ func handleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin) {
 		return
 	}
 
-	targetConn, err := sshConn.Dial("tcp", targetAddr)
+	targetConn, client, err := dialTargetWithRetries(rr, targetAddr, retryUpstreams, failThreshold, failTTL)
 	if err != nil {
 		writeSocks5Reply(conn, socksReplyGeneral)
-		log.Printf("Failed to connect target via SSH %s: %v", targetAddr, err)
+		log.Printf("Failed to connect target via SSH %s after retries: %v", targetAddr, err)
 		return
 	}
 	defer targetConn.Close()
 
 	writeSocks5Reply(conn, socksReplySucceeded)
 	log.Printf("SOCKS5 forwarding to %s", targetAddr)
-	tunnelBidirectional(conn, targetConn)
+	start := time.Now()
+	rightToLeft, leftToRight := tunnelBidirectional(conn, targetConn)
+
+	if isLikelyTargetBlocked(start, rightToLeft, leftToRight) {
+		err = fmt.Errorf("tunnel ended too quickly without upstream response")
+		rr.ReportTargetFailure(client, targetAddr, failThreshold, failTTL, err)
+		log.Printf("Marked upstream-target as failed after short tunnel: upstream=%s target=%s c2u=%d u2c=%d elapsed=%s", client.ServerAddr(), targetAddr, leftToRight, rightToLeft, time.Since(start).Round(time.Millisecond))
+	} else {
+		rr.ReportTargetSuccess(client, targetAddr)
+	}
+}
+
+func dialTargetWithRetries(rr *sshroundrobin.RoundRobin, targetAddr string, maxUpstreams int, failThreshold int, failTTL time.Duration) (net.Conn, *sshroundrobin.SSHClient, error) {
+	excluded := make(map[string]struct{})
+	if maxUpstreams <= 0 {
+		maxUpstreams = 1
+	}
+
+	var lastErr error
+	for i := 0; i < maxUpstreams; i++ {
+		client, err := rr.GetForTarget(targetAddr, excluded)
+		if err != nil {
+			if lastErr != nil {
+				return nil, nil, fmt.Errorf("%w; last dial error: %v", err, lastErr)
+			}
+			return nil, nil, err
+		}
+
+		upstreamAddr := client.ServerAddr()
+		excluded[upstreamAddr] = struct{}{}
+		log.Printf("Upstream selected %s (mode=%s hits=%d target=%s)", upstreamAddr, client.ServerMode(), client.SelectionCount(), targetAddr)
+
+		sshConn := client.Client()
+		targetConn, dialErr := sshConn.Dial("tcp", targetAddr)
+		if dialErr == nil {
+			return targetConn, client, nil
+		}
+
+		rr.ReportTargetFailure(client, targetAddr, failThreshold, failTTL, dialErr)
+		log.Printf("Dial target failed, trying next upstream: upstream=%s target=%s err=%v", upstreamAddr, targetAddr, dialErr)
+		lastErr = fmt.Errorf("%s failed target %s: %w", upstreamAddr, targetAddr, dialErr)
+	}
+
+	if lastErr == nil {
+		return nil, nil, fmt.Errorf("no upstream attempts made")
+	}
+
+	return nil, nil, lastErr
+}
+
+func isLikelyTargetBlocked(start time.Time, upstreamToClient int64, clientToUpstream int64) bool {
+	elapsed := time.Since(start)
+	if elapsed > 2*time.Second {
+		return false
+	}
+	if clientToUpstream == 0 {
+		return false
+	}
+	return upstreamToClient == 0
 }
 
 func main() {
@@ -196,7 +250,7 @@ func main() {
 	log.Println("Starting SSH Round-Robin Proxy...")
 
 	cfg := config.ParseConfig()
-	log.Printf("Config loaded - Bind: %s, Servers: %s, Strategy: %s, MaxActiveUpstreams: %d, Cloudflared force: %t, ProxyCommand set: %t, UpstreamStats: %t", cfg.BindAddr, cfg.ServersFile, cfg.Strategy, cfg.MaxActiveUpstreams, cfg.Cloudflared, cfg.ProxyCommand != "", cfg.ShowUpstreamStats)
+	log.Printf("Config loaded - Bind: %s, Servers: %s, Strategy: %s, MaxActiveUpstreams: %d, TargetRetryUpstreams: %d, TargetFailThreshold: %d, TargetFailTTL: %s, Cloudflared force: %t, ProxyCommand set: %t, UpstreamStats: %t", cfg.BindAddr, cfg.ServersFile, cfg.Strategy, cfg.MaxActiveUpstreams, cfg.TargetRetryUpstreams, cfg.TargetFailThreshold, cfg.TargetFailTTL, cfg.Cloudflared, cfg.ProxyCommand != "", cfg.ShowUpstreamStats)
 	if cfg.Mode == "socks5" && (cfg.TargetHost != "127.0.0.1" || cfg.TargetPort != 80) {
 		log.Printf("Ignoring target %s:%d because MODE=socks5 uses client-requested destinations", cfg.TargetHost, cfg.TargetPort)
 	}
@@ -299,9 +353,9 @@ func main() {
 			continue
 		}
 		if cfg.Mode == "socks5" {
-			go handleSocks5Connection(conn, rr)
+			go handleSocks5Connection(conn, rr, cfg.TargetRetryUpstreams, cfg.TargetFailThreshold, cfg.TargetFailTTL)
 		} else {
-			go handleConnection(conn, rr, cfg.TargetHost, cfg.TargetPort)
+			go handleConnection(conn, rr, cfg.TargetHost, cfg.TargetPort, cfg.TargetRetryUpstreams, cfg.TargetFailThreshold, cfg.TargetFailTTL)
 		}
 	}
 }

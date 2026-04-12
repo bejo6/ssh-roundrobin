@@ -48,6 +48,10 @@ Contoh:
 | `MODE` | `-mode` | `socks5` | `socks5` atau `tcp-forward` |
 | `PROXY_COMMAND` | `-proxy-command` | - | Proxy command |
 | `RETRY_COUNT` | `-retry` | `3` | Retry count |
+| `TARGET_RETRY_UPSTREAMS` | `-target-retry-upstreams` | `3` | Jumlah upstream maksimum per request target |
+| `TARGET_FAIL_THRESHOLD` | `-target-fail-threshold` | `1` | Jumlah gagal sebelum upstream-target pair di-block sementara |
+| `TARGET_FAIL_TTL` | `-target-fail-ttl` | `10m` | Durasi block upstream-target pair setelah threshold tercapai |
+| `SHOW_UPSTREAM_STATS` | `-show-upstream-stats` | `true` | Tampilkan ringkasan stats upstream di log |
 | `ENV_FILE` | `-env-file` | `.env` | Path ke .env file |
 
 ## Usage

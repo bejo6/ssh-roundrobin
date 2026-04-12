@@ -18,13 +18,20 @@ const (
 )
 
 type RoundRobin struct {
-	servers   []*SSHClient
-	mu        sync.RWMutex
-	index     uint32
-	strategy  string
-	maxActive int
-	activeIdx int
-	hasActive bool
+	servers        []*SSHClient
+	mu             sync.RWMutex
+	index          uint32
+	strategy       string
+	maxActive      int
+	activeIdx      int
+	hasActive      bool
+	targetFailures map[string]targetFailureState
+}
+
+type targetFailureState struct {
+	FailCount    int
+	BlockedUntil time.Time
+	LastError    string
 }
 
 type UpstreamStat struct {
@@ -68,13 +75,72 @@ func NewRoundRobin(strategy string, maxActive int) *RoundRobin {
 	}
 
 	return &RoundRobin{
-		servers:   make([]*SSHClient, 0),
-		index:     0,
-		strategy:  selected,
-		maxActive: maxActive,
-		activeIdx: 0,
-		hasActive: false,
+		servers:        make([]*SSHClient, 0),
+		index:          0,
+		strategy:       selected,
+		maxActive:      maxActive,
+		activeIdx:      0,
+		hasActive:      false,
+		targetFailures: make(map[string]targetFailureState),
 	}
+}
+
+func targetFailureKey(upstreamAddr, targetAddr string) string {
+	return upstreamAddr + "|" + targetAddr
+}
+
+func (rr *RoundRobin) isTargetBlockedLocked(client *SSHClient, targetAddr string, now time.Time) bool {
+	if targetAddr == "" || client == nil {
+		return false
+	}
+
+	state, ok := rr.targetFailures[targetFailureKey(client.ServerAddr(), targetAddr)]
+	if !ok {
+		return false
+	}
+
+	if state.BlockedUntil.After(now) {
+		return true
+	}
+
+	delete(rr.targetFailures, targetFailureKey(client.ServerAddr(), targetAddr))
+	return false
+}
+
+func (rr *RoundRobin) ReportTargetFailure(client *SSHClient, targetAddr string, threshold int, ttl time.Duration, err error) {
+	if client == nil || targetAddr == "" {
+		return
+	}
+	if threshold <= 0 {
+		threshold = 1
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+
+	key := targetFailureKey(client.ServerAddr(), targetAddr)
+	state := rr.targetFailures[key]
+	state.FailCount++
+	if err != nil {
+		state.LastError = err.Error()
+	}
+	if state.FailCount >= threshold {
+		state.BlockedUntil = time.Now().Add(ttl)
+	}
+	rr.targetFailures[key] = state
+}
+
+func (rr *RoundRobin) ReportTargetSuccess(client *SSHClient, targetAddr string) {
+	if client == nil || targetAddr == "" {
+		return
+	}
+
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	delete(rr.targetFailures, targetFailureKey(client.ServerAddr(), targetAddr))
 }
 
 func (rr *RoundRobin) connectedCountLocked() int {
@@ -94,6 +160,10 @@ func (rr *RoundRobin) Add(client *SSHClient) {
 }
 
 func (rr *RoundRobin) Get() (*SSHClient, error) {
+	return rr.GetForTarget("", nil)
+}
+
+func (rr *RoundRobin) GetForTarget(targetAddr string, exclude map[string]struct{}) (*SSHClient, error) {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 
@@ -102,20 +172,31 @@ func (rr *RoundRobin) Get() (*SSHClient, error) {
 	}
 
 	if rr.strategy == StrategyFailover {
-		return rr.getFailoverLocked()
+		return rr.getFailoverLocked(targetAddr, exclude)
 	}
 
-	return rr.getLoadBalanceLocked()
+	return rr.getLoadBalanceLocked(targetAddr, exclude)
 }
 
-func (rr *RoundRobin) getLoadBalanceLocked() (*SSHClient, error) {
+func (rr *RoundRobin) getLoadBalanceLocked(targetAddr string, exclude map[string]struct{}) (*SSHClient, error) {
 	connectedCount := rr.connectedCountLocked()
 	startIdx := atomic.AddUint32(&rr.index, 1) - 1
 	checked := 0
+	now := time.Now()
 
 	for checked < len(rr.servers) {
 		idx := int(startIdx+uint32(checked)) % len(rr.servers)
 		client := rr.servers[idx]
+		if exclude != nil {
+			if _, ok := exclude[client.ServerAddr()]; ok {
+				checked++
+				continue
+			}
+		}
+		if rr.isTargetBlockedLocked(client, targetAddr, now) {
+			checked++
+			continue
+		}
 
 		if client.IsConnected() {
 			client.MarkSelected()
@@ -136,15 +217,25 @@ func (rr *RoundRobin) getLoadBalanceLocked() (*SSHClient, error) {
 	return nil, fmt.Errorf("no available servers")
 }
 
-func (rr *RoundRobin) getFailoverLocked() (*SSHClient, error) {
+func (rr *RoundRobin) getFailoverLocked(targetAddr string, exclude map[string]struct{}) (*SSHClient, error) {
+	now := time.Now()
 	if rr.hasActive && rr.activeIdx >= 0 && rr.activeIdx < len(rr.servers) {
 		active := rr.servers[rr.activeIdx]
+		if exclude != nil {
+			if _, ok := exclude[active.ServerAddr()]; ok {
+				goto scanNext
+			}
+		}
+		if rr.isTargetBlockedLocked(active, targetAddr, now) {
+			goto scanNext
+		}
 		if active.IsConnected() || active.EnsureConnected() == nil {
 			active.MarkSelected()
 			return active, nil
 		}
 	}
 
+scanNext:
 	startIdx := 0
 	if rr.hasActive && len(rr.servers) > 0 {
 		startIdx = (rr.activeIdx + 1) % len(rr.servers)
@@ -159,6 +250,14 @@ func (rr *RoundRobin) getFailoverLocked() (*SSHClient, error) {
 		}
 
 		client := rr.servers[idx]
+		if exclude != nil {
+			if _, ok := exclude[client.ServerAddr()]; ok {
+				continue
+			}
+		}
+		if rr.isTargetBlockedLocked(client, targetAddr, now) {
+			continue
+		}
 		if client.IsConnected() || client.EnsureConnected() == nil {
 			rr.activeIdx = idx
 			rr.hasActive = true
@@ -176,7 +275,7 @@ func (rr *RoundRobin) GetWithRetry(maxRetries int, retryDelay time.Duration) (*S
 	var lastErr error
 
 	for i := 0; i < maxRetries; i++ {
-		client, err := rr.Get()
+		client, err := rr.GetForTarget("", nil)
 		if err == nil {
 			return client, nil
 		}
