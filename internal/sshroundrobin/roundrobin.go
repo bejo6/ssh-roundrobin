@@ -22,8 +22,30 @@ type RoundRobin struct {
 	mu        sync.RWMutex
 	index     uint32
 	strategy  string
+	maxActive int
 	activeIdx int
 	hasActive bool
+}
+
+type UpstreamStat struct {
+	Addr             string
+	Mode             string
+	Healthy          bool
+	Active           bool
+	SelectedCount    uint64
+	ReconnectCount   uint64
+	HealthcheckCount uint64
+	LastSelectedAt   time.Time
+	LastCheckedAt    time.Time
+	LastError        string
+}
+
+type HealthCheckReport struct {
+	Checked      int
+	Recovered    []string
+	Failed       []string
+	SwitchedFrom string
+	SwitchedTo   string
 }
 
 func normalizeStrategy(strategy string) string {
@@ -39,19 +61,30 @@ func normalizeStrategy(strategy string) string {
 	}
 }
 
-func NewRoundRobin(strategy ...string) *RoundRobin {
-	selected := StrategyFailover
-	if len(strategy) > 0 {
-		selected = normalizeStrategy(strategy[0])
+func NewRoundRobin(strategy string, maxActive int) *RoundRobin {
+	selected := normalizeStrategy(strategy)
+	if maxActive <= 0 {
+		maxActive = 1
 	}
 
 	return &RoundRobin{
 		servers:   make([]*SSHClient, 0),
 		index:     0,
 		strategy:  selected,
+		maxActive: maxActive,
 		activeIdx: 0,
 		hasActive: false,
 	}
+}
+
+func (rr *RoundRobin) connectedCountLocked() int {
+	count := 0
+	for _, client := range rr.servers {
+		if client.IsConnected() {
+			count++
+		}
+	}
+	return count
 }
 
 func (rr *RoundRobin) Add(client *SSHClient) {
@@ -76,7 +109,7 @@ func (rr *RoundRobin) Get() (*SSHClient, error) {
 }
 
 func (rr *RoundRobin) getLoadBalanceLocked() (*SSHClient, error) {
-
+	connectedCount := rr.connectedCountLocked()
 	startIdx := atomic.AddUint32(&rr.index, 1) - 1
 	checked := 0
 
@@ -85,16 +118,19 @@ func (rr *RoundRobin) getLoadBalanceLocked() (*SSHClient, error) {
 		client := rr.servers[idx]
 
 		if client.IsConnected() {
+			client.MarkSelected()
 			return client, nil
+		}
+
+		if connectedCount < rr.maxActive {
+			if err := client.EnsureConnected(); err == nil {
+				connectedCount++
+				client.MarkSelected()
+				return client, nil
+			}
 		}
 
 		checked++
-	}
-
-	for _, client := range rr.servers {
-		if err := client.Reconnect(); err == nil {
-			return client, nil
-		}
 	}
 
 	return nil, fmt.Errorf("no available servers")
@@ -103,10 +139,8 @@ func (rr *RoundRobin) getLoadBalanceLocked() (*SSHClient, error) {
 func (rr *RoundRobin) getFailoverLocked() (*SSHClient, error) {
 	if rr.hasActive && rr.activeIdx >= 0 && rr.activeIdx < len(rr.servers) {
 		active := rr.servers[rr.activeIdx]
-		if active.IsConnected() {
-			return active, nil
-		}
-		if err := active.Reconnect(); err == nil {
+		if active.IsConnected() || active.EnsureConnected() == nil {
+			active.MarkSelected()
 			return active, nil
 		}
 	}
@@ -125,15 +159,10 @@ func (rr *RoundRobin) getFailoverLocked() (*SSHClient, error) {
 		}
 
 		client := rr.servers[idx]
-		if client.IsConnected() {
+		if client.IsConnected() || client.EnsureConnected() == nil {
 			rr.activeIdx = idx
 			rr.hasActive = true
-			return client, nil
-		}
-
-		if err := client.Reconnect(); err == nil {
-			rr.activeIdx = idx
-			rr.hasActive = true
+			client.MarkSelected()
 			return client, nil
 		}
 	}
@@ -201,4 +230,111 @@ func (rr *RoundRobin) Len() int {
 	rr.mu.RLock()
 	defer rr.mu.RUnlock()
 	return len(rr.servers)
+}
+
+func (rr *RoundRobin) StatsSnapshot() []UpstreamStat {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+
+	stats := make([]UpstreamStat, 0, len(rr.servers))
+	for idx, client := range rr.servers {
+		clientStats := client.Stats()
+		stats = append(stats, UpstreamStat{
+			Addr:             clientStats.Addr,
+			Mode:             clientStats.Mode,
+			Healthy:          clientStats.Healthy,
+			Active:           rr.hasActive && idx == rr.activeIdx,
+			SelectedCount:    clientStats.SelectedCount,
+			ReconnectCount:   clientStats.ReconnectCount,
+			HealthcheckCount: clientStats.HealthcheckCount,
+			LastSelectedAt:   clientStats.LastSelectedAt,
+			LastCheckedAt:    clientStats.LastCheckedAt,
+			LastError:        clientStats.LastError,
+		})
+	}
+
+	return stats
+}
+
+func (rr *RoundRobin) StatsSummary() string {
+	stats := rr.StatsSnapshot()
+	parts := make([]string, 0, len(stats))
+	for _, stat := range stats {
+		part := fmt.Sprintf("%s{mode=%s healthy=%t active=%t hits=%d reconnects=%d checks=%d", stat.Addr, stat.Mode, stat.Healthy, stat.Active, stat.SelectedCount, stat.ReconnectCount, stat.HealthcheckCount)
+		if stat.LastError != "" {
+			part += fmt.Sprintf(" err=%q", stat.LastError)
+		}
+		part += "}"
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, " ")
+}
+
+func (rr *RoundRobin) RunHealthChecks() HealthCheckReport {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+
+	report := HealthCheckReport{}
+	if len(rr.servers) == 0 {
+		return report
+	}
+
+	healthy := make([]bool, len(rr.servers))
+	for idx, client := range rr.servers {
+		if !client.IsConnected() {
+			healthy[idx] = false
+			continue
+		}
+
+		report.Checked++
+		wasHealthy := client.IsHealthy()
+		err := client.HealthCheck()
+		if err != nil {
+			healthy[idx] = false
+			if wasHealthy {
+				report.Failed = append(report.Failed, client.ServerAddr())
+			}
+			continue
+		}
+
+		healthy[idx] = true
+		if !wasHealthy {
+			report.Recovered = append(report.Recovered, client.ServerAddr())
+		}
+	}
+
+	if rr.strategy != StrategyFailover {
+		return report
+	}
+
+	if rr.hasActive && rr.activeIdx >= 0 && rr.activeIdx < len(healthy) && healthy[rr.activeIdx] {
+		return report
+	}
+
+	if rr.hasActive && rr.activeIdx >= 0 && rr.activeIdx < len(rr.servers) {
+		report.SwitchedFrom = rr.servers[rr.activeIdx].ServerAddr()
+	}
+
+	for idx, ok := range healthy {
+		if !ok {
+			continue
+		}
+		rr.activeIdx = idx
+		rr.hasActive = true
+		report.SwitchedTo = rr.servers[idx].ServerAddr()
+		return report
+	}
+
+	for idx, client := range rr.servers {
+		if client.EnsureConnected() == nil {
+			rr.activeIdx = idx
+			rr.hasActive = true
+			report.SwitchedTo = client.ServerAddr()
+			return report
+		}
+	}
+
+	rr.activeIdx = 0
+	rr.hasActive = false
+	return report
 }

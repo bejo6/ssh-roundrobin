@@ -36,6 +36,7 @@ type Config struct {
 	ProxyCommand   string
 	Cloudflared    bool
 	Strategy       string
+	MaxActiveUpstreams int
 	TargetHost     string
 	TargetPort     int
 	HealthCheck    bool
@@ -91,6 +92,7 @@ func ParseConfig() *Config {
 	flag.BoolVar(&cloudflaredShort, "cf", cloudflaredDefault, "Force Cloudflare proxy command mode")
 	flag.BoolVar(&cloudflaredLong, "cloudflared", cloudflaredDefault, "Force Cloudflare proxy command mode")
 	flag.StringVar(&cfg.Strategy, "strategy", getEnv("SELECT_STRATEGY", sshroundrobin.StrategyFailover), "Server selection strategy: failover or loadbalance")
+	flag.IntVar(&cfg.MaxActiveUpstreams, "max-active-upstreams", getEnvInt("MAX_ACTIVE_UPSTREAMS", 2), "Max simultaneously connected upstreams in loadbalance mode")
 	flag.StringVar(&cfg.TargetHost, "target-host", getEnv("TARGET_HOST", "127.0.0.1"), "Target host to forward to")
 	flag.IntVar(&cfg.TargetPort, "target-port", getEnvInt("TARGET_PORT", 80), "Target port to forward to")
 	flag.BoolVar(&cfg.HealthCheck, "health-check", getEnvBool("HEALTH_CHECK", true) == "true", "Enable health check")
@@ -123,6 +125,10 @@ func ParseConfig() *Config {
 	default:
 		fmt.Fprintf(os.Stderr, "invalid mode %q: must be socks5 or tcp-forward\n", cfg.Mode)
 		os.Exit(2)
+	}
+
+	if cfg.MaxActiveUpstreams <= 0 {
+		cfg.MaxActiveUpstreams = 1
 	}
 
 	cfg.TargetPort = getEnvInt("TARGET_PORT", cfg.TargetPort)

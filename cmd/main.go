@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"ssh-roundrobin/internal/config"
 	"ssh-roundrobin/internal/sshroundrobin"
@@ -53,7 +54,7 @@ func handleConnection(conn net.Conn, rr *sshroundrobin.RoundRobin, targetHost st
 		log.Printf("Failed to get server: %v", err)
 		return
 	}
-	log.Printf("Upstream selected %s (mode=%s)", client.ServerAddr(), client.ServerMode())
+	log.Printf("Upstream selected %s (mode=%s hits=%d)", client.ServerAddr(), client.ServerMode(), client.SelectionCount())
 
 	sshConn := client.Client()
 
@@ -134,7 +135,7 @@ func handleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin) {
 		log.Printf("Failed to get server: %v", err)
 		return
 	}
-	log.Printf("Upstream selected %s (mode=%s)", client.ServerAddr(), client.ServerMode())
+	log.Printf("Upstream selected %s (mode=%s hits=%d)", client.ServerAddr(), client.ServerMode(), client.SelectionCount())
 
 	sshConn := client.Client()
 
@@ -195,7 +196,7 @@ func main() {
 	log.Println("Starting SSH Round-Robin Proxy...")
 
 	cfg := config.ParseConfig()
-	log.Printf("Config loaded - Bind: %s, Servers: %s, Strategy: %s, Cloudflared force: %t, ProxyCommand set: %t", cfg.BindAddr, cfg.ServersFile, cfg.Strategy, cfg.Cloudflared, cfg.ProxyCommand != "")
+	log.Printf("Config loaded - Bind: %s, Servers: %s, Strategy: %s, MaxActiveUpstreams: %d, Cloudflared force: %t, ProxyCommand set: %t", cfg.BindAddr, cfg.ServersFile, cfg.Strategy, cfg.MaxActiveUpstreams, cfg.Cloudflared, cfg.ProxyCommand != "")
 	if cfg.Mode == "socks5" && (cfg.TargetHost != "127.0.0.1" || cfg.TargetPort != 80) {
 		log.Printf("Ignoring target %s:%d because MODE=socks5 uses client-requested destinations", cfg.TargetHost, cfg.TargetPort)
 	}
@@ -209,16 +210,29 @@ func main() {
 		log.Fatal("No servers configured")
 	}
 
-	rr := sshroundrobin.NewRoundRobin(cfg.Strategy)
+	rr := sshroundrobin.NewRoundRobin(cfg.Strategy, cfg.MaxActiveUpstreams)
+
+	eagerLimit := cfg.MaxActiveUpstreams
+	if cfg.Strategy == sshroundrobin.StrategyFailover {
+		eagerLimit = 1
+	}
+	connectedAtStartup := 0
 
 	for _, server := range servers {
-		client, err := sshroundrobin.NewSSHClient(server)
-		if err != nil {
-			log.Printf("Failed to connect to %s (mode=%s): %v", server.Addr(), server.AuthMethod.String(), err)
-			continue
+		if connectedAtStartup < eagerLimit {
+			client, err := sshroundrobin.NewSSHClient(server)
+			if err == nil {
+				rr.Add(client)
+				connectedAtStartup++
+				log.Printf("Connected to %s (mode=%s)", server.Addr(), server.AuthMethod.String())
+				continue
+			}
+
+			log.Printf("Startup connect failed for %s (mode=%s), queued as lazy upstream: %v", server.Addr(), server.AuthMethod.String(), err)
 		}
-		rr.Add(client)
-		log.Printf("Connected to %s (mode=%s)", server.Addr(), server.AuthMethod.String())
+
+		rr.Add(sshroundrobin.NewSSHClientLazy(server))
+		log.Printf("Registered lazy upstream %s (mode=%s)", server.Addr(), server.AuthMethod.String())
 	}
 
 	if rr.Len() == 0 {
@@ -238,12 +252,38 @@ func main() {
 		log.Printf("SSH Round-Robin TCP forward listening on %s -> %s", cfg.BindAddr, targetAddr)
 	}
 
+	if cfg.HealthCheck {
+		go func() {
+			ticker := time.NewTicker(cfg.HealthInterval)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				report := rr.RunHealthChecks()
+				if report.Checked == 0 {
+					continue
+				}
+
+				if report.SwitchedFrom != "" || report.SwitchedTo != "" {
+					log.Printf("Health check switch: from=%s to=%s", report.SwitchedFrom, report.SwitchedTo)
+				}
+				if len(report.Failed) > 0 {
+					log.Printf("Health check failed upstreams: %v", report.Failed)
+				}
+				if len(report.Recovered) > 0 {
+					log.Printf("Health check recovered upstreams: %v", report.Recovered)
+				}
+				log.Printf("Upstream stats: %s", rr.StatsSummary())
+			}
+		}()
+	}
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		<-sigChan
 		log.Println("Shutting down...")
+		log.Printf("Final upstream stats: %s", rr.StatsSummary())
 		rr.CloseAll()
 		os.Exit(0)
 	}()
