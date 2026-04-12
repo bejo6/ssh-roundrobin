@@ -40,6 +40,7 @@ type Config struct {
 	TargetHost     string
 	TargetPort     int
 	HealthCheck    bool
+	ShowUpstreamStats bool
 	HealthInterval time.Duration
 	RetryCount     int
 	RetryDelay     time.Duration
@@ -76,6 +77,7 @@ func getEnvBool(key string, defaultValue bool) string {
 func ParseConfig() *Config {
 	cfg := &Config{}
 	cloudflaredDefault := getEnvBool("CLOUDFLARED", false) == "true"
+	showStatsDefault := getEnvBool("SHOW_UPSTREAM_STATS", false) == "true"
 	var cloudflaredShort bool
 	var cloudflaredLong bool
 
@@ -96,6 +98,7 @@ func ParseConfig() *Config {
 	flag.StringVar(&cfg.TargetHost, "target-host", getEnv("TARGET_HOST", "127.0.0.1"), "Target host to forward to")
 	flag.IntVar(&cfg.TargetPort, "target-port", getEnvInt("TARGET_PORT", 80), "Target port to forward to")
 	flag.BoolVar(&cfg.HealthCheck, "health-check", getEnvBool("HEALTH_CHECK", true) == "true", "Enable health check")
+	flag.BoolVar(&cfg.ShowUpstreamStats, "upstream-stats", showStatsDefault, "Show periodic and final upstream stats")
 	flag.DurationVar(&cfg.HealthInterval, "health-interval", 30*time.Second, "Health check interval")
 	flag.IntVar(&cfg.RetryCount, "retry", getEnvInt("RETRY_COUNT", 3), "Number of retries")
 	flag.DurationVar(&cfg.RetryDelay, "retry-delay", 1*time.Second, "Delay between retries")

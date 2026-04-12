@@ -258,16 +258,46 @@ func (rr *RoundRobin) StatsSnapshot() []UpstreamStat {
 
 func (rr *RoundRobin) StatsSummary() string {
 	stats := rr.StatsSnapshot()
-	parts := make([]string, 0, len(stats))
-	for _, stat := range stats {
-		part := fmt.Sprintf("%s{mode=%s healthy=%t active=%t hits=%d reconnects=%d checks=%d", stat.Addr, stat.Mode, stat.Healthy, stat.Active, stat.SelectedCount, stat.ReconnectCount, stat.HealthcheckCount)
-		if stat.LastError != "" {
-			part += fmt.Sprintf(" err=%q", stat.LastError)
-		}
-		part += "}"
-		parts = append(parts, part)
+	if len(stats) == 0 {
+		return "\n  - no upstreams"
 	}
-	return strings.Join(parts, " ")
+
+	const (
+		ansiReset   = "\033[0m"
+		ansiRed     = "\033[31m"
+		ansiGreen   = "\033[32m"
+		ansiYellow  = "\033[33m"
+		ansiBlue    = "\033[34m"
+		ansiMagenta = "\033[35m"
+		ansiCyan    = "\033[36m"
+		ansiWhite   = "\033[37m"
+	)
+
+	upstreamColors := []string{ansiCyan, ansiBlue, ansiMagenta, ansiWhite}
+	lines := make([]string, 0, len(stats))
+
+	for idx, stat := range stats {
+		upstreamColor := upstreamColors[idx%len(upstreamColors)]
+		addr := fmt.Sprintf("%s%s%s", upstreamColor, stat.Addr, ansiReset)
+
+		health := fmt.Sprintf("%sdown%s", ansiRed, ansiReset)
+		if stat.Healthy {
+			health = fmt.Sprintf("%sup%s", ansiGreen, ansiReset)
+		}
+
+		active := "no"
+		if stat.Active {
+			active = fmt.Sprintf("%syes%s", ansiYellow, ansiReset)
+		}
+
+		line := fmt.Sprintf("  - %s mode=%s health=%s active=%s hits=%d reconnects=%d checks=%d", addr, stat.Mode, health, active, stat.SelectedCount, stat.ReconnectCount, stat.HealthcheckCount)
+		if stat.LastError != "" {
+			line += fmt.Sprintf(" err=%q", stat.LastError)
+		}
+		lines = append(lines, line)
+	}
+
+	return "\n" + strings.Join(lines, "\n")
 }
 
 func (rr *RoundRobin) RunHealthChecks() HealthCheckReport {

@@ -196,7 +196,7 @@ func main() {
 	log.Println("Starting SSH Round-Robin Proxy...")
 
 	cfg := config.ParseConfig()
-	log.Printf("Config loaded - Bind: %s, Servers: %s, Strategy: %s, MaxActiveUpstreams: %d, Cloudflared force: %t, ProxyCommand set: %t", cfg.BindAddr, cfg.ServersFile, cfg.Strategy, cfg.MaxActiveUpstreams, cfg.Cloudflared, cfg.ProxyCommand != "")
+	log.Printf("Config loaded - Bind: %s, Servers: %s, Strategy: %s, MaxActiveUpstreams: %d, Cloudflared force: %t, ProxyCommand set: %t, UpstreamStats: %t", cfg.BindAddr, cfg.ServersFile, cfg.Strategy, cfg.MaxActiveUpstreams, cfg.Cloudflared, cfg.ProxyCommand != "", cfg.ShowUpstreamStats)
 	if cfg.Mode == "socks5" && (cfg.TargetHost != "127.0.0.1" || cfg.TargetPort != 80) {
 		log.Printf("Ignoring target %s:%d because MODE=socks5 uses client-requested destinations", cfg.TargetHost, cfg.TargetPort)
 	}
@@ -272,7 +272,9 @@ func main() {
 				if len(report.Recovered) > 0 {
 					log.Printf("Health check recovered upstreams: %v", report.Recovered)
 				}
-				log.Printf("Upstream stats: %s", rr.StatsSummary())
+				if cfg.ShowUpstreamStats {
+					log.Printf("Upstream stats: %s", rr.StatsSummary())
+				}
 			}
 		}()
 	}
@@ -283,7 +285,9 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Shutting down...")
-		log.Printf("Final upstream stats: %s", rr.StatsSummary())
+		if cfg.ShowUpstreamStats {
+			log.Printf("Final upstream stats: %s", rr.StatsSummary())
+		}
 		rr.CloseAll()
 		os.Exit(0)
 	}()
