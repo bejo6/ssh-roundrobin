@@ -64,7 +64,7 @@ endef
 # ===============================
 # Default Targets
 # ===============================
-.PHONY: default all clean local build run test install lint
+.PHONY: default all clean local build run install
 
 default: local
 
@@ -86,14 +86,8 @@ build: local
 run: local
 	./$(BUILD_DIR)/$(APP_NAME)-$(HOST_OS)-$(HOST_ARCH)
 
-test:
-	$(GOCMD) test ./...
-
 install:
 	$(GOCMD) install ./cmd
-
-lint:
-	golangci-lint run ./...
 
 # ===============================
 # OS / ARCH Targets
