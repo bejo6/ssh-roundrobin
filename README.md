@@ -93,4 +93,4 @@ host:port:password
 Distributed under the MIT License.
 
 ---
-Diracik dengan fokus dan kafein oleh ⚡ **GitHub Copilot**.
+Crafted with focus and caffeine by ⚡ **GitHub Copilot**.
