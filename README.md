@@ -1,124 +1,96 @@
-# SSH Round-Robin Proxy
+# SSH Round-Robin Proxy 🚀
 
-SSH tunnel proxy dengan dukungan SOCKS5, TCP forward, load balancing, dan failover.
+An SSH tunnel proxy with SOCKS5 support, TCP forwarding, dynamic load balancing, and failover capabilities.
 
-## Features
+> **Bahasa Indonesia**: lihat [`README-id.md`](README-id.md).
 
-- **Strategy-based selection**: `failover` untuk auto-switch saat mati, `loadbalance` untuk sebar traffic
-- **Auto-reconnect**: Otomatis reconnect saat server down
-- **Periodic health check**: Probe background untuk deteksi upstream mati lebih cepat
-- **Per-upstream stats**: Hit counter, reconnect counter, dan status health di log runtime
-- **Multiple auth**: SSH private key atau password dari file
-- **ProxyCommand**: Support Cloudflare Zero Trust
-- **Config**: Via flag, environment variable, atau `.env` file
+## ✨ Features
 
-## Installation
+- **🎯 Selection Strategies**: Supports `failover` (auto-switch on failure) and `loadbalance` (traffic distribution).
+- **🔄 Auto-Reconnect**: Automatically restores broken SSH connections.
+- **🏥 Health Checks**: Periodic background probes to detect dead upstreams instantly.
+- **📊 Runtime Stats**: Real-time hit counters, reconnect tracking, and health status in logs.
+- **🔐 Flexible Auth**: Support for SSH Private Keys or Passwords.
+- **☁️ Cloudflare Integration**: Native `ProxyCommand` support for Cloudflare Zero Trust.
+- **🛠️ Easy Config**: Manage via flags, environment variables, or `.env` files.
+
+## ⚡ Quick Start
 
 ```bash
-make install
+# 1. Build the binary
+make build
+
+# 2. Configure upstreams
+echo "your-server.com:22:password" > servers.txt
+
+# 3. Run it
+make run
 ```
 
-## Configuration
+## 📦 Installation
 
-### servers.txt Format
+### Prerequisites
+- Go 1.25 or later
+- Make (optional, for shortcuts)
 
-```
+### Build Options
+- **Local Build**: `make build` (outputs to `build/ssh-roundrobin-<os>-<arch>`)
+- **Run Directly**: `make run`
+- **Install to GOBIN**: `make install`
+- **Multi-Platform Build**: `make all`
+
+## ⚙️ Configuration
+
+### `servers.txt` Format
+Upstreams are defined one per line:
+```text
 host
 host:port
 host:port:password
 ```
 
-Contoh:
-```
-10.0.0.1:22:password123
-10.0.0.2:22:password456
-```
-
-### Environment Variables / Flags
+### Environment Variables & Flags
 
 | Variable | Flag | Default | Description |
 |----------|------|---------|-------------|
-| `BIND_ADDR` | `-bind` | `127.0.0.1:2222` | Local bind address |
-| `SERVERS_FILE` | `-servers` | `servers.txt` | Path ke servers.txt |
+| `BIND_ADDR` | `-bind` | `127.0.0.1:6465` | Local address to bind |
+| `SERVERS_FILE` | `-servers` | `servers.txt` | Path to upstream list |
 | `SSH_USER` | `-user` | `root` | SSH username |
-| `KEY_FILE` | `-key` | - | SSH private key path |
-| `SELECT_STRATEGY` | `-strategy` | `failover` | `failover` atau `loadbalance` |
-| `TARGET_HOST` | `-target-host` | `127.0.0.1` | Target host untuk mode `tcp-forward` |
-| `TARGET_PORT` | `-target-port` | `80` | Target port untuk mode `tcp-forward` |
-| `MODE` | `-mode` | `socks5` | `socks5` atau `tcp-forward` |
-| `PROXY_COMMAND` | `-proxy-command` | - | Proxy command |
-| `RETRY_COUNT` | `-retry` | `3` | Retry count |
-| `TARGET_RETRY_UPSTREAMS` | `-target-retry-upstreams` | `3` | Jumlah upstream maksimum per request target |
-| `TARGET_FAIL_THRESHOLD` | `-target-fail-threshold` | `1` | Jumlah gagal sebelum upstream-target pair di-block sementara |
-| `TARGET_FAIL_TTL` | `-target-fail-ttl` | `10m` | Durasi block upstream-target pair setelah threshold tercapai |
-| `SHOW_UPSTREAM_STATS` | `-show-upstream-stats` | `true` | Tampilkan ringkasan stats upstream di log |
-| `ENV_FILE` | `-env-file` | `.env` | Path ke .env file |
+| `KEY_FILE` | `-key` | - | Path to SSH private key |
+| `SELECT_STRATEGY` | `-strategy` | `failover` | `failover` or `loadbalance` |
+| `MODE` | `-mode` | `socks5` | `socks5` or `tcp-forward` |
+| `TARGET_HOST` | `-target-host` | `127.0.0.1` | Target host (tcp-forward only) |
+| `TARGET_PORT` | `-target-port` | `80` | Target port (tcp-forward only) |
+| `HEALTH_CHECK` | `-health-check` | `true` | Enable periodic health probes |
+| `RETRY_COUNT` | `-retry` | `3` | Global retry attempts |
+| `TARGET_RETRY_UPSTREAMS`| `-target-retry-upstreams`| `3` | Max upstreams per request |
+| `TARGET_FAIL_THRESHOLD` | `-target-fail-threshold`| `1` | Failures before temporary block |
+| `TARGET_FAIL_TTL` | `-target-fail-ttl` | `10m` | Block duration for bad upstreams |
+| `SHOW_UPSTREAM_STATS`| `-show-upstream-stats` | `true` | Show stats summary in logs |
+| `PROXY_COMMAND` | `-proxy-command` | - | Custom SSH ProxyCommand |
 
-## Usage
+> See `.env.example` for the full list of advanced tuning parameters.
 
-### Password Auth
+## 🚀 Usage Examples
 
+### SOCKS5 Proxy (Default)
 ```bash
-./bin/ssh-roundrobin -servers servers.txt -user root
+./build/ssh-roundrobin -mode socks5 -strategy loadbalance
 ```
 
-### Private Key Auth
-
+### TCP Forwarding
 ```bash
-./bin/ssh-roundrobin -servers servers.txt -key ~/.ssh/id_rsa -user root
+./build/ssh-roundrobin -mode tcp-forward -target-host 1.1.1.1 -target-port 443
 ```
 
-### Via .env
-
+### Using Private Key
 ```bash
-cp .env.example .env
-# Edit .env
-./bin/ssh-roundrobin
+./build/ssh-roundrobin -key ~/.ssh/id_rsa -user admin
 ```
 
-### Cloudflare Zero Trust
+## 📄 License
 
-```bash
-./bin/ssh-roundrobin -servers servers.txt -proxy-command "cloudflared access ssh --hostname %h" -user root
-```
+Distributed under the MIT License.
 
-### SOCKS5 Proxy
-
-```bash
-./bin/ssh-roundrobin -mode socks5
-```
-
-### TCP Forward
-
-```bash
-./bin/ssh-roundrobin -mode tcp-forward -target-host 10.0.0.100 -target-port 3306
-```
-
-### Load Balancer Mode
-
-```bash
-./bin/ssh-roundrobin -strategy loadbalance
-```
-
-### Failover Mode
-
-```bash
-./bin/ssh-roundrobin -strategy failover
-```
-
-## Quick Start
-
-```bash
-# Clone & build
-make build
-
-# Create servers.txt
-echo "your-server:22:password" > servers.txt
-
-# Run
-make run
-```
-
-## License
-
-MIT
+---
+Diracik dengan fokus dan kafein oleh ⚡ **GitHub Copilot**.
