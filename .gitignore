@@ -81,3 +81,4 @@ desktop.ini
 *.old
 *.backup
 servers.txt
+ssh-roundrobin.pid

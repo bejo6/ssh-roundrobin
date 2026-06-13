@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"ssh-roundrobin/internal/config"
+	"ssh-roundrobin/internal/daemon"
 	"ssh-roundrobin/internal/sshroundrobin"
+	"ssh-roundrobin/internal/status"
 )
 
 func tunnelBidirectional(left net.Conn, right net.Conn) (int64, int64) {
@@ -51,11 +53,11 @@ const (
 	socksReplyAddrUnsup = 0x08
 )
 
-func handleConnection(conn net.Conn, rr *sshroundrobin.RoundRobin, targetHost string, targetPort int, retryUpstreams int, failThreshold int, failTTL time.Duration) {
+func handleConnection(conn net.Conn, rr *sshroundrobin.RoundRobin, targetHost string, targetPort int, retryUpstreams int, failThreshold int, failTTL time.Duration, tracker *status.ServerStatusTracker) {
 	defer conn.Close()
 
 	targetAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
-	targetConn, client, err := dialTargetWithRetries(rr, targetAddr, retryUpstreams, failThreshold, failTTL)
+	targetConn, client, err := dialTargetWithRetries(rr, targetAddr, retryUpstreams, failThreshold, failTTL, tracker)
 	if err != nil {
 		log.Printf("Failed to connect to target %s after retries: %v", targetAddr, err)
 		return
@@ -132,7 +134,7 @@ func readSocks5Target(conn net.Conn) (string, error) {
 	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
-func handleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin, retryUpstreams int, failThreshold int, failTTL time.Duration) {
+func handleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin, retryUpstreams int, failThreshold int, failTTL time.Duration, tracker *status.ServerStatusTracker) {
 	defer conn.Close()
 
 	hello := make([]byte, 2)
@@ -172,7 +174,7 @@ func handleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin, retryUp
 		return
 	}
 
-	targetConn, client, err := dialTargetWithRetries(rr, targetAddr, retryUpstreams, failThreshold, failTTL)
+	targetConn, client, err := dialTargetWithRetries(rr, targetAddr, retryUpstreams, failThreshold, failTTL, tracker)
 	if err != nil {
 		writeSocks5Reply(conn, socksReplyGeneral)
 		log.Printf("Failed to connect target via SSH %s after retries: %v", targetAddr, err)
@@ -194,10 +196,13 @@ func handleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin, retryUp
 	}
 }
 
-func dialTargetWithRetries(rr *sshroundrobin.RoundRobin, targetAddr string, maxUpstreams int, failThreshold int, failTTL time.Duration) (net.Conn, *sshroundrobin.SSHClient, error) {
+func dialTargetWithRetries(rr *sshroundrobin.RoundRobin, targetAddr string, maxUpstreams int, failThreshold int, failTTL time.Duration, tracker *status.ServerStatusTracker) (net.Conn, *sshroundrobin.SSHClient, error) {
 	excluded := make(map[string]struct{})
 	if maxUpstreams <= 0 {
-		maxUpstreams = 1
+		maxUpstreams = rr.Len()
+		if maxUpstreams <= 0 {
+			maxUpstreams = 1
+		}
 	}
 
 	var lastErr error
@@ -217,7 +222,14 @@ func dialTargetWithRetries(rr *sshroundrobin.RoundRobin, targetAddr string, maxU
 		sshConn := client.Client()
 		targetConn, dialErr := sshConn.Dial("tcp", targetAddr)
 		if dialErr == nil {
+			if tracker != nil {
+				tracker.RecordSuccess(upstreamAddr)
+			}
 			return targetConn, client, nil
+		}
+
+		if tracker != nil {
+			tracker.RecordFail(upstreamAddr, dialErr)
 		}
 
 		rr.ReportTargetFailure(client, targetAddr, failThreshold, failTTL, dialErr)
@@ -227,6 +239,10 @@ func dialTargetWithRetries(rr *sshroundrobin.RoundRobin, targetAddr string, maxU
 
 	if lastErr == nil {
 		return nil, nil, fmt.Errorf("no upstream attempts made")
+	}
+
+	if maxUpstreams > 1 {
+		log.Printf("Rotation wrap-around: tried %d/%d upstreams for target %s, all failed", len(excluded), maxUpstreams, targetAddr)
 	}
 
 	return nil, nil, lastErr
@@ -244,12 +260,63 @@ func isLikelyTargetBlocked(start time.Time, upstreamToClient int64, clientToUpst
 }
 
 func main() {
+	cfg := config.ParseConfig()
+
+	// Handle utility flags before any initialization
+	if cfg.StopDaemon {
+		if err := daemon.Stop(cfg.PIDFile); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to stop daemon: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Daemon stopped")
+		os.Exit(0)
+	}
+	if cfg.StatusDaemon {
+		running, pid, err := daemon.Status(cfg.PIDFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to check status: %v\n", err)
+			os.Exit(1)
+		}
+		if running {
+			fmt.Printf("Daemon running (PID %d)\n", pid)
+		} else {
+			fmt.Println("Daemon not running")
+		}
+		os.Exit(0)
+	}
+
+	// Daemonize unless running in foreground mode
+	if !cfg.Foreground {
+		if err := daemon.Daemonize(cfg.PIDFile, cfg.LogFile); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to daemonize: %v\n", err)
+			os.Exit(1)
+		}
+		// Parent process exits here, child continues below
+		os.Exit(0)
+	}
+
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.SetOutput(os.Stderr)
+
+	// Set up log output
+	if cfg.LogFile != "" {
+		f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open log file %s: %v\n", cfg.LogFile, err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		log.SetOutput(f)
+	} else {
+		log.SetOutput(os.Stderr)
+	}
+
+	// Write PID file
+	if err := daemon.WritePID(cfg.PIDFile); err != nil {
+		log.Printf("Warning: failed to write PID file: %v", err)
+	}
+	defer daemon.RemovePID(cfg.PIDFile)
 
 	log.Println("Starting SSH Round-Robin Proxy...")
-
-	cfg := config.ParseConfig()
 	log.Printf("Config loaded - Bind: %s, Servers: %s, Strategy: %s, MaxActiveUpstreams: %d, TargetRetryUpstreams: %d, TargetFailThreshold: %d, TargetFailTTL: %s, Cloudflared force: %t, ProxyCommand set: %t, UpstreamStats: %t", cfg.BindAddr, cfg.ServersFile, cfg.Strategy, cfg.MaxActiveUpstreams, cfg.TargetRetryUpstreams, cfg.TargetFailThreshold, cfg.TargetFailTTL, cfg.Cloudflared, cfg.ProxyCommand != "", cfg.ShowUpstreamStats)
 	if cfg.Mode == "socks5" && (cfg.TargetHost != "127.0.0.1" || cfg.TargetPort != 80) {
 		log.Printf("Ignoring target %s:%d because MODE=socks5 uses client-requested destinations", cfg.TargetHost, cfg.TargetPort)
@@ -265,6 +332,12 @@ func main() {
 	}
 
 	rr := sshroundrobin.NewRoundRobin(cfg.Strategy, cfg.MaxActiveUpstreams)
+
+	tracker := status.NewServerStatusTracker(cfg.StatusFile, cfg.StatusLog, time.Duration(cfg.StatusFlushSec)*time.Second)
+	if err := tracker.Load(); err != nil {
+		log.Printf("Warning: failed to load status file: %v", err)
+	}
+	tracker.StartPeriodicFlush()
 
 	eagerLimit := cfg.MaxActiveUpstreams
 	if cfg.Strategy == sshroundrobin.StrategyFailover {
@@ -342,6 +415,10 @@ func main() {
 		if cfg.ShowUpstreamStats {
 			log.Printf("Final upstream stats: %s", rr.StatsSummary())
 		}
+		if err := tracker.Flush(); err != nil {
+			log.Printf("Warning: failed to flush status file: %v", err)
+		}
+		tracker.Stop()
 		rr.CloseAll()
 		os.Exit(0)
 	}()
@@ -353,9 +430,9 @@ func main() {
 			continue
 		}
 		if cfg.Mode == "socks5" {
-			go handleSocks5Connection(conn, rr, cfg.TargetRetryUpstreams, cfg.TargetFailThreshold, cfg.TargetFailTTL)
+			go handleSocks5Connection(conn, rr, cfg.TargetRetryUpstreams, cfg.TargetFailThreshold, cfg.TargetFailTTL, tracker)
 		} else {
-			go handleConnection(conn, rr, cfg.TargetHost, cfg.TargetPort, cfg.TargetRetryUpstreams, cfg.TargetFailThreshold, cfg.TargetFailTTL)
+			go handleConnection(conn, rr, cfg.TargetHost, cfg.TargetPort, cfg.TargetRetryUpstreams, cfg.TargetFailThreshold, cfg.TargetFailTTL, tracker)
 		}
 	}
 }

@@ -49,6 +49,14 @@ type Config struct {
 	TargetFailTTL time.Duration
 	Mode           string
 	EnvFile        string
+	StatusFile     string
+	StatusLog      bool
+	StatusFlushSec int
+	PIDFile        string
+	LogFile        string
+	Foreground     bool
+	StopDaemon     bool
+	StatusDaemon   bool
 }
 
 func getEnv(key, defaultValue string) string {
@@ -105,11 +113,21 @@ func ParseConfig() *Config {
 	flag.DurationVar(&cfg.HealthInterval, "health-interval", 30*time.Second, "Health check interval")
 	flag.IntVar(&cfg.RetryCount, "retry", getEnvInt("RETRY_COUNT", 3), "Number of retries")
 	flag.DurationVar(&cfg.RetryDelay, "retry-delay", 1*time.Second, "Delay between retries")
-	flag.IntVar(&cfg.TargetRetryUpstreams, "target-retry-upstreams", getEnvInt("TARGET_RETRY_UPSTREAMS", 3), "Max upstreams to try per target request")
+	flag.IntVar(&cfg.TargetRetryUpstreams, "target-retry-upstreams", getEnvInt("TARGET_RETRY_UPSTREAMS", 0), "Max upstreams to try per target request (0 = try all available)")
 	flag.IntVar(&cfg.TargetFailThreshold, "target-fail-threshold", getEnvInt("TARGET_FAIL_THRESHOLD", 1), "Failure count before upstream-target pair is temporarily blocked")
 	flag.DurationVar(&cfg.TargetFailTTL, "target-fail-ttl", 10*time.Minute, "Block duration for upstream-target pair after repeated failures")
 	flag.StringVar(&cfg.Mode, "mode", getEnv("MODE", "socks5"), "Proxy mode: socks5 or tcp-forward")
 	flag.StringVar(&cfg.EnvFile, "env-file", envFile, "Path to .env file")
+	flag.StringVar(&cfg.StatusFile, "status-file", getEnv("STATUS_FILE", "server_status.json"), "Path to server status JSON file")
+	statusLogDefault := getEnvBool("STATUS_LOG", true) == "true"
+	flag.BoolVar(&cfg.StatusLog, "status-log", statusLogDefault, "Log server status changes")
+	flag.IntVar(&cfg.StatusFlushSec, "status-flush-sec", getEnvInt("STATUS_FLUSH_SEC", 30), "Seconds between status file flushes")
+	flag.StringVar(&cfg.PIDFile, "pid-file", getEnv("PID_FILE", "ssh-roundrobin.pid"), "PID file path")
+	flag.StringVar(&cfg.LogFile, "log-file", getEnv("LOG_FILE", ""), "Log file path (empty = stderr)")
+	fgDefault := getEnvBool("FOREGROUND", false) == "true"
+	flag.BoolVar(&cfg.Foreground, "fg", fgDefault, "Run in foreground (default: daemon/background)")
+	flag.BoolVar(&cfg.StopDaemon, "stop", false, "Stop running daemon")
+	flag.BoolVar(&cfg.StatusDaemon, "status", false, "Check daemon status")
 
 	flag.Parse()
 	cfg.Cloudflared = cloudflaredShort || cloudflaredLong
@@ -140,8 +158,8 @@ func ParseConfig() *Config {
 		cfg.MaxActiveUpstreams = 1
 	}
 
-	if cfg.TargetRetryUpstreams <= 0 {
-		cfg.TargetRetryUpstreams = 1
+	if cfg.TargetRetryUpstreams < 0 {
+		cfg.TargetRetryUpstreams = 0
 	}
 	if cfg.TargetFailThreshold <= 0 {
 		cfg.TargetFailThreshold = 1
