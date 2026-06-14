@@ -61,6 +61,9 @@ func (a *App) handleSignals() {
 		signal.Stop(sigChan)
 		log.Println("Shutting down...")
 
+		// Signal all loops to exit immediately, before cleanup.
+		close(a.shutdownCh)
+
 		// Stop health check first to prevent it from using resources we're about to close.
 		close(a.healthStop)
 
@@ -78,6 +81,5 @@ func (a *App) handleSignals() {
 		if a.logFile != nil {
 			a.logFile.Close()
 		}
-		close(a.shutdownCh)
 	}()
 }
