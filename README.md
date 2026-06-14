@@ -13,6 +13,9 @@ An SSH tunnel proxy with SOCKS5 support, TCP forwarding, dynamic load balancing,
 - **🔐 Flexible Auth**: Support for SSH Private Keys or Passwords.
 - **☁️ Cloudflare Integration**: Native `ProxyCommand` support for Cloudflare Zero Trust.
 - **🛠️ Easy Config**: Manage via flags, environment variables, or `.env` files.
+- **🔌 Connection Limits**: Bounded concurrent connections to prevent resource exhaustion.
+- **🖥️ Daemon Mode**: Run as background daemon with PID management.
+- **📈 Status Tracking**: Persistent server health tracking across restarts.
 
 ## ⚡ Quick Start
 
@@ -23,21 +26,50 @@ make build
 # 2. Configure upstreams
 echo "your-server.com:22:password" > servers.txt
 
-# 3. Run it
-make run
+# 3. Run it (foreground mode)
+./build/ssh-roundrobin -fg
 ```
 
 ## 📦 Installation
 
 ### Prerequisites
 - Go 1.25 or later
-- Make (optional, for shortcuts)
+- Make
 
-### Build Options
-- **Local Build**: `make build` (outputs to `build/ssh-roundrobin-<os>-<arch>`)
-- **Run Directly**: `make run`
-- **Install to GOBIN**: `make install`
-- **Multi-Platform Build**: `make all`
+### Build
+
+```bash
+# Build for current host OS/arch → build/ssh-roundrobin-<os>-<arch>
+make build
+
+# Build and run immediately
+make run
+
+# Build for all platforms (linux, darwin, freebsd, openbsd × all arches)
+make all
+
+# Install to $GOPATH/bin
+make install
+```
+
+### Cleanup
+
+```bash
+# Remove all build artifacts
+make clean
+```
+
+### Available Make Targets
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Build for current host OS/arch |
+| `make run` | Build and run |
+| `make install` | Install to `$GOPATH/bin` |
+| `make all` | Cross-compile for all platforms |
+| `make build-linux-amd64` | Build for Linux amd64 only |
+| `make build-darwin-arm64` | Build for macOS arm64 only |
+| `make clean` | Remove `build/` directory |
 
 ## ⚙️ Configuration
 
@@ -63,13 +95,51 @@ host:port:password
 | `TARGET_PORT` | `-target-port` | `80` | Target port (tcp-forward only) |
 | `HEALTH_CHECK` | `-health-check` | `true` | Enable periodic health probes |
 | `RETRY_COUNT` | `-retry` | `3` | Global retry attempts |
-| `TARGET_RETRY_UPSTREAMS`| `-target-retry-upstreams`| `3` | Max upstreams per request |
+| `TARGET_RETRY_UPSTREAMS`| `-target-retry-upstreams`| `0` | Max upstreams per request (0 = try all) |
 | `TARGET_FAIL_THRESHOLD` | `-target-fail-threshold`| `1` | Failures before temporary block |
 | `TARGET_FAIL_TTL` | `-target-fail-ttl` | `10m` | Block duration for bad upstreams |
 | `SHOW_UPSTREAM_STATS`| `-show-upstream-stats` | `true` | Show stats summary in logs |
 | `PROXY_COMMAND` | `-proxy-command` | - | Custom SSH ProxyCommand |
+| `MAX_ACTIVE_UPSTREAMS` | `-max-active-upstreams` | `1` | Max concurrent active SSH connections |
+| `MAX_CONNECTIONS` | `-max-connections` | `100` | Max concurrent client connections |
 
 > See `.env.example` for the full list of advanced tuning parameters.
+
+## 🖥️ Daemon Mode
+
+By default, ssh-roundrobin runs as a background daemon:
+
+```bash
+# Start as daemon (default)
+./build/ssh-roundrobin
+
+# Run in foreground
+./build/ssh-roundrobin -fg
+
+# Check daemon status
+./build/ssh-roundrobin -status
+
+# Stop daemon
+./build/ssh-roundrobin -stop
+```
+
+### Daemon Options
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `FOREGROUND` | `-fg` | `false` | Run in foreground (default: daemon) |
+| `PID_FILE` | `-pid-file` | `ssh-roundrobin.pid` | PID file path |
+| `LOG_FILE` | `-log-file` | - | Log file path (auto in daemon mode) |
+
+## 📈 Server Status Tracking
+
+Server health is tracked and persisted to survive restarts:
+
+| Variable | Flag | Default | Description |
+|----------|------|---------|-------------|
+| `STATUS_FILE` | `-status-file` | `server_status.json` | Status persistence file |
+| `STATUS_LOG` | `-status-log` | `true` | Log status changes |
+| `STATUS_FLUSH_SEC` | `-status-flush-sec` | `30` | Seconds between status file flushes |
 
 ## 🚀 Usage Examples
 
@@ -88,9 +158,39 @@ host:port:password
 ./build/ssh-roundrobin -key ~/.ssh/id_rsa -user admin
 ```
 
+### Loadbalanced with Multiple Active Upstreams
+```bash
+./build/ssh-roundrobin -strategy loadbalance -max-active-upstreams 5
+```
+
+### With Cloudflare ProxyCommand
+```bash
+./build/ssh-roundrobin -proxy-command "cloudflared access ssh --hostname %h"
+```
+
+## 🏗️ Architecture
+
+```
+cmd/main.go              → Entry point (~80 lines)
+internal/
+├── app/                 → Application bootstrap and lifecycle
+│   ├── app.go           → Accept loop, connection semaphore
+│   ├── connect.go       → Server initialization
+│   └── shutdown.go      → Signal handling, health checks
+├── config/              → Configuration parsing
+├── daemon/              → Daemon fork, PID management
+├── proxy/               → SOCKS5, TCP forwarding, tunnel, dial
+├── sshroundrobin/       → Round-robin selection, SSH client, health checks
+└── status/              → Server health tracking and persistence
+```
+
+## 🧪 Testing
+
+```bash
+# Run all tests
+make test
+```
+
 ## 📄 License
 
 Distributed under the MIT License.
-
----
-Crafted with focus and caffeine by ⚡ **GitHub Copilot**.
