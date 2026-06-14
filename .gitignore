@@ -82,3 +82,15 @@ desktop.ini
 *.backup
 *.pid
 servers.txt
+
+
+#-------------------------
+# Agent/AI tool folders
+#-------------------------
+.openclaude/
+.claude/
+.opencode/
+.commandcode/
+.agent/
+.agents/
+.codex/

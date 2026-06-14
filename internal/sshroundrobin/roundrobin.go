@@ -18,14 +18,15 @@ const (
 )
 
 type RoundRobin struct {
-	servers        []*SSHClient
-	mu             sync.RWMutex
-	index          uint32
-	strategy       string
-	maxActive      int
-	activeIdx      int
-	hasActive      bool
-	targetFailures map[string]targetFailureState
+	servers            []*SSHClient
+	mu                 sync.RWMutex
+	index              uint32
+	strategy           string
+	maxActive          int
+	activeIdx          int
+	hasActive          bool
+	targetFailures     map[string]targetFailureState
+	OnConnectionError  func(addr string, err error)
 }
 
 type targetFailureState struct {
@@ -143,6 +144,12 @@ func (rr *RoundRobin) ReportTargetSuccess(client *SSHClient, targetAddr string) 
 	delete(rr.targetFailures, targetFailureKey(client.ServerAddr(), targetAddr))
 }
 
+func (rr *RoundRobin) notifyConnectionError(addr string, err error) {
+	if rr.OnConnectionError != nil {
+		rr.OnConnectionError(addr, err)
+	}
+}
+
 func (rr *RoundRobin) connectedCountLocked() int {
 	count := 0
 	for _, client := range rr.servers {
@@ -208,6 +215,8 @@ func (rr *RoundRobin) getLoadBalanceLocked(targetAddr string, exclude map[string
 				connectedCount++
 				client.MarkSelected()
 				return client, nil
+			} else {
+				rr.notifyConnectionError(client.ServerAddr(), err)
 			}
 		}
 
@@ -229,9 +238,15 @@ func (rr *RoundRobin) getFailoverLocked(targetAddr string, exclude map[string]st
 		if rr.isTargetBlockedLocked(active, targetAddr, now) {
 			goto scanNext
 		}
-		if active.IsConnected() || active.EnsureConnected() == nil {
+		if active.IsConnected() {
 			active.MarkSelected()
 			return active, nil
+		}
+		if err := active.EnsureConnected(); err == nil {
+			active.MarkSelected()
+			return active, nil
+		} else {
+			rr.notifyConnectionError(active.ServerAddr(), err)
 		}
 	}
 
@@ -258,11 +273,19 @@ scanNext:
 		if rr.isTargetBlockedLocked(client, targetAddr, now) {
 			continue
 		}
-		if client.IsConnected() || client.EnsureConnected() == nil {
+		if client.IsConnected() {
 			rr.activeIdx = idx
 			rr.hasActive = true
 			client.MarkSelected()
 			return client, nil
+		}
+		if err := client.EnsureConnected(); err == nil {
+			rr.activeIdx = idx
+			rr.hasActive = true
+			client.MarkSelected()
+			return client, nil
+		} else {
+			rr.notifyConnectionError(client.ServerAddr(), err)
 		}
 	}
 
