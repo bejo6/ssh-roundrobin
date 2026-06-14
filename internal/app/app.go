@@ -44,8 +44,8 @@ func New(cfg *config.Config) *App {
 func (a *App) Run() {
 	a.setupLogging()
 	a.writePID()
+	a.startListener() // bind port first — fail fast if address is in use
 	a.connectServers()
-	a.startListener()
 	a.startHealthCheck()
 	a.handleSignals()
 	a.acceptLoop()

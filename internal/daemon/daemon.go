@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Daemonize forks the current process into a background daemon.
@@ -152,7 +153,17 @@ func Stop(pidFile string) error {
 		return fmt.Errorf("failed to send SIGTERM to PID %d: %w", pid, err)
 	}
 
-	return nil
+	// Wait for the process to actually exit so the port is released.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := process.Signal(syscall.Signal(0)); err != nil {
+			// Process is gone.
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return fmt.Errorf("process %d did not exit within 10s after SIGTERM", pid)
 }
 
 func Status(pidFile string) (running bool, pid int, err error) {
