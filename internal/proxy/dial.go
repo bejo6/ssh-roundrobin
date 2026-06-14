@@ -40,6 +40,11 @@ func DialTargetWithRetries(rr *sshroundrobin.RoundRobin, targetAddr string,
 		log.Printf("Upstream selected %s (mode=%s hits=%d target=%s)", upstreamAddr, client.ServerMode(), client.SelectionCount(), targetAddr)
 
 		sshConn := client.Client()
+		if sshConn == nil {
+			rr.ReportTargetFailure(client, targetAddr, failThreshold, failTTL, fmt.Errorf("ssh client is nil"))
+			lastErr = fmt.Errorf("%s: ssh client is nil", upstreamAddr)
+			continue
+		}
 		targetConn, dialErr := sshConn.Dial("tcp", targetAddr)
 		if dialErr == nil {
 			if tracker != nil {

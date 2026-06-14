@@ -18,8 +18,10 @@ func HandleConnection(conn net.Conn, rr *sshroundrobin.RoundRobin,
 	tracker *status.ServerStatusTracker) {
 
 	defer conn.Close()
+	remoteAddr := conn.RemoteAddr()
 
 	targetAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
+	log.Printf("TCP forward connection from %s -> %s", remoteAddr, targetAddr)
 	targetConn, client, err := DialTargetWithRetries(rr, targetAddr, retryUpstreams, failThreshold, failTTL, tracker)
 	if err != nil {
 		log.Printf("Failed to connect to target %s after retries: %v", targetAddr, err)

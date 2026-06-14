@@ -26,7 +26,9 @@ const (
 )
 
 func writeSocks5Reply(conn net.Conn, reply byte) {
-	_, _ = conn.Write([]byte{socksVersion5, reply, 0x00, socksAtypIPv4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	if _, err := conn.Write([]byte{socksVersion5, reply, 0x00, socksAtypIPv4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); err != nil {
+		log.Printf("SOCKS5 reply write failed (reply=0x%02x): %v", reply, err)
+	}
 }
 
 func readSocks5Target(conn net.Conn) (string, error) {
@@ -89,6 +91,8 @@ func HandleSocks5Connection(conn net.Conn, rr *sshroundrobin.RoundRobin,
 	tracker *status.ServerStatusTracker) {
 
 	defer conn.Close()
+	remoteAddr := conn.RemoteAddr()
+	log.Printf("SOCKS5 connection from %s", remoteAddr)
 
 	hello := make([]byte, 2)
 	if _, err := io.ReadFull(conn, hello); err != nil {

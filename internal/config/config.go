@@ -1,12 +1,9 @@
 package config
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"os"
-	"os/user"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -19,11 +16,11 @@ import (
 // expandPath expands ~ to home directory
 func expandPath(path string) (string, error) {
 	if strings.HasPrefix(path, "~") {
-		homeUser, err := user.Current()
+		homeUser, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
-		return strings.Replace(path, "~", homeUser.HomeDir, 1), nil
+		return strings.Replace(path, "~", homeUser, 1), nil
 	}
 	return path, nil
 }
@@ -37,6 +34,7 @@ type Config struct {
 	Cloudflared    bool
 	Strategy       string
 	MaxActiveUpstreams int
+	MaxConnections int
 	TargetHost     string
 	TargetPort     int
 	HealthCheck    bool
@@ -75,20 +73,17 @@ func getEnvInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
-func getEnvBool(key string, defaultValue bool) string {
+func getEnvBool(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
-		return value
+		return strings.EqualFold(value, "true")
 	}
-	if defaultValue {
-		return "true"
-	}
-	return "false"
+	return defaultValue
 }
 
 func ParseConfig() *Config {
 	cfg := &Config{}
-	cloudflaredDefault := getEnvBool("CLOUDFLARED", false) == "true"
-	showStatsDefault := getEnvBool("SHOW_UPSTREAM_STATS", false) == "true"
+	cloudflaredDefault := getEnvBool("CLOUDFLARED", false)
+	showStatsDefault := getEnvBool("SHOW_UPSTREAM_STATS", false)
 	var cloudflaredShort bool
 	var cloudflaredLong bool
 
@@ -106,9 +101,10 @@ func ParseConfig() *Config {
 	flag.BoolVar(&cloudflaredLong, "cloudflared", cloudflaredDefault, "Force Cloudflare proxy command mode")
 	flag.StringVar(&cfg.Strategy, "strategy", getEnv("SELECT_STRATEGY", sshroundrobin.StrategyFailover), "Server selection strategy: failover or loadbalance")
 	flag.IntVar(&cfg.MaxActiveUpstreams, "max-active-upstreams", getEnvInt("MAX_ACTIVE_UPSTREAMS", 2), "Max simultaneously connected upstreams in loadbalance mode")
+	flag.IntVar(&cfg.MaxConnections, "max-connections", getEnvInt("MAX_CONNECTIONS", 100), "Max concurrent connections (0 = unlimited)")
 	flag.StringVar(&cfg.TargetHost, "target-host", getEnv("TARGET_HOST", "127.0.0.1"), "Target host to forward to")
 	flag.IntVar(&cfg.TargetPort, "target-port", getEnvInt("TARGET_PORT", 80), "Target port to forward to")
-	flag.BoolVar(&cfg.HealthCheck, "health-check", getEnvBool("HEALTH_CHECK", true) == "true", "Enable health check")
+	flag.BoolVar(&cfg.HealthCheck, "health-check", getEnvBool("HEALTH_CHECK", true), "Enable health check")
 	flag.BoolVar(&cfg.ShowUpstreamStats, "upstream-stats", showStatsDefault, "Show periodic and final upstream stats")
 	flag.DurationVar(&cfg.HealthInterval, "health-interval", 30*time.Second, "Health check interval")
 	flag.IntVar(&cfg.RetryCount, "retry", getEnvInt("RETRY_COUNT", 3), "Number of retries")
@@ -119,45 +115,23 @@ func ParseConfig() *Config {
 	flag.StringVar(&cfg.Mode, "mode", getEnv("MODE", "socks5"), "Proxy mode: socks5 or tcp-forward")
 	flag.StringVar(&cfg.EnvFile, "env-file", envFile, "Path to .env file")
 	flag.StringVar(&cfg.StatusFile, "status-file", getEnv("STATUS_FILE", "server_status.json"), "Path to server status JSON file")
-	statusLogDefault := getEnvBool("STATUS_LOG", true) == "true"
-	flag.BoolVar(&cfg.StatusLog, "status-log", statusLogDefault, "Log server status changes")
+	flag.BoolVar(&cfg.StatusLog, "status-log", getEnvBool("STATUS_LOG", true), "Log server status changes")
 	flag.IntVar(&cfg.StatusFlushSec, "status-flush-sec", getEnvInt("STATUS_FLUSH_SEC", 30), "Seconds between status file flushes")
 	flag.StringVar(&cfg.PIDFile, "pid-file", getEnv("PID_FILE", "ssh-roundrobin.pid"), "PID file path")
 	flag.StringVar(&cfg.LogFile, "log-file", getEnv("LOG_FILE", ""), "Log file path (empty = stderr)")
-	fgDefault := getEnvBool("FOREGROUND", false) == "true"
-	flag.BoolVar(&cfg.Foreground, "fg", fgDefault, "Run in foreground (default: daemon/background)")
+	flag.BoolVar(&cfg.Foreground, "fg", getEnvBool("FOREGROUND", false), "Run in foreground (default: daemon/background)")
 	flag.BoolVar(&cfg.StopDaemon, "stop", false, "Stop running daemon")
 	flag.BoolVar(&cfg.StatusDaemon, "status", false, "Check daemon status")
 
 	flag.Parse()
 	cfg.Cloudflared = cloudflaredShort || cloudflaredLong
 
-	switch strings.ToLower(strings.TrimSpace(cfg.Strategy)) {
-	case "":
-		cfg.Strategy = sshroundrobin.StrategyFailover
-	case sshroundrobin.StrategyLoadBalance:
-		cfg.Strategy = sshroundrobin.StrategyLoadBalance
-	case sshroundrobin.StrategyFailover:
-		cfg.Strategy = sshroundrobin.StrategyFailover
-	default:
-		fmt.Fprintf(os.Stderr, "invalid strategy %q: must be %s or %s\n", cfg.Strategy, sshroundrobin.StrategyLoadBalance, sshroundrobin.StrategyFailover)
-		os.Exit(2)
-	}
-
-	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
-	case "", "socks5":
-		cfg.Mode = "socks5"
-	case "tcp-forward", "tcp", "forward", "static", "static-forward", "http":
-		cfg.Mode = "tcp-forward"
-	default:
-		fmt.Fprintf(os.Stderr, "invalid mode %q: must be socks5 or tcp-forward\n", cfg.Mode)
-		os.Exit(2)
-	}
+	validateStrategy(cfg)
+	validateMode(cfg)
 
 	if cfg.MaxActiveUpstreams <= 0 {
 		cfg.MaxActiveUpstreams = 1
 	}
-
 	if cfg.TargetRetryUpstreams < 0 {
 		cfg.TargetRetryUpstreams = 0
 	}
@@ -170,7 +144,6 @@ func ParseConfig() *Config {
 
 	cfg.TargetPort = getEnvInt("TARGET_PORT", cfg.TargetPort)
 
-	// Expand ~ in paths
 	if cfg.KeyFile != "" {
 		expanded, err := expandPath(cfg.KeyFile)
 		if err != nil {
@@ -183,103 +156,28 @@ func ParseConfig() *Config {
 	return cfg
 }
 
-func ParseServersFile(path string, username, keyFile, proxyCommand string, forceCloudflared bool) ([]*sshroundrobin.SSHServer, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open servers file: %w", err)
+func validateStrategy(cfg *Config) {
+	switch strings.ToLower(strings.TrimSpace(cfg.Strategy)) {
+	case "":
+		cfg.Strategy = sshroundrobin.StrategyFailover
+	case sshroundrobin.StrategyLoadBalance:
+		cfg.Strategy = sshroundrobin.StrategyLoadBalance
+	case sshroundrobin.StrategyFailover:
+		cfg.Strategy = sshroundrobin.StrategyFailover
+	default:
+		fmt.Fprintf(os.Stderr, "invalid strategy %q: must be %s or %s\n", cfg.Strategy, sshroundrobin.StrategyLoadBalance, sshroundrobin.StrategyFailover)
+		os.Exit(2)
 	}
-	defer file.Close()
+}
 
-	if forceCloudflared && proxyCommand == "" {
-		return nil, fmt.Errorf("-cf/-cloudflared mode requires PROXY_COMMAND or -proxy-command")
+func validateMode(cfg *Config) {
+	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
+	case "", "socks5":
+		cfg.Mode = "socks5"
+	case "tcp-forward", "tcp", "forward", "static", "static-forward", "http":
+		cfg.Mode = "tcp-forward"
+	default:
+		fmt.Fprintf(os.Stderr, "invalid mode %q: must be socks5 or tcp-forward\n", cfg.Mode)
+		os.Exit(2)
 	}
-
-	servers := make([]*sshroundrobin.SSHServer, 0)
-	scanner := bufio.NewScanner(file)
-
-	for lineNum := 1; scanner.Scan(); lineNum++ {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		fields := strings.Split(line, ":")
-		if len(fields) < 1 || len(fields) > 3 {
-			return nil, fmt.Errorf("invalid line %d: %s (format: host, host:port, or host:port:password)", lineNum, line)
-		}
-
-		host := fields[0]
-		if host == "" {
-			return nil, fmt.Errorf("invalid line %d: empty host", lineNum)
-		}
-
-		// Default SSH port is 22
-		port := 22
-		if len(fields) >= 2 && fields[1] != "" {
-			p, err := strconv.Atoi(fields[1])
-			if err != nil {
-				return nil, fmt.Errorf("invalid port at line %d: %s", lineNum, fields[1])
-			}
-			port = p
-		}
-
-		// Password is only set if explicitly provided in format host:port:password
-		password := ""
-		if len(fields) == 3 {
-			password = fields[2]
-		}
-
-		server := &sshroundrobin.SSHServer{
-			Host:     host,
-			Port:     port,
-			Username: username,
-			KeyPath:  keyFile,
-		}
-
-		if password != "" && password != "-" {
-			server.Password = password
-		}
-
-		useProxyCommand := forceCloudflared || proxyCommand != ""
-		if useProxyCommand {
-			server.AuthMethod = sshroundrobin.AuthMethodProxyCommand
-			server.ProxyCommand = proxyCommand
-
-			if server.KeyPath == "" && server.Password == "" {
-				currentUser, err := user.Current()
-				if err != nil {
-					return nil, fmt.Errorf("failed to get current user: %w", err)
-				}
-				defaultKeyPath := filepath.Join(currentUser.HomeDir, ".ssh", "id_rsa")
-				if _, err := os.Stat(defaultKeyPath); err == nil {
-					server.KeyPath = defaultKeyPath
-				}
-			}
-		} else if server.KeyPath != "" {
-			server.AuthMethod = sshroundrobin.AuthMethodKey
-		} else if server.Password != "" {
-			server.AuthMethod = sshroundrobin.AuthMethodPassword
-		} else {
-			// Default to ~/.ssh/id_rsa
-			currentUser, err := user.Current()
-			if err != nil {
-				return nil, fmt.Errorf("failed to get current user: %w", err)
-			}
-			defaultKeyPath := filepath.Join(currentUser.HomeDir, ".ssh", "id_rsa")
-			if _, err := os.Stat(defaultKeyPath); err == nil {
-				server.AuthMethod = sshroundrobin.AuthMethodKey
-				server.KeyPath = defaultKeyPath
-			} else {
-				return nil, fmt.Errorf("no auth method specified and default key %s not found for server %s at line %d", defaultKeyPath, host, lineNum)
-			}
-		}
-
-		servers = append(servers, server)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading servers file: %w", err)
-	}
-
-	return servers, nil
 }
